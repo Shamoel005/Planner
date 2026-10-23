@@ -2,10 +2,17 @@
 
 package com.mydash.planner
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
@@ -15,6 +22,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -45,40 +53,44 @@ data class Item(
     val due: Long = 0L, val priority: Int = 1,
     val target: Int = 10, val current: Int = 0,
     val done: Boolean = false, val pinned: Boolean = false,
-    val days: String = ""
+    val days: String = "", val doneAt: Long = 0L
 )
 
 object Store {
     private fun file(c: Context) = File(c.filesDir, "items.json")
-    fun load(c: Context): List<Item> {
-        val f = file(c)
-        if (!f.exists()) return emptyList()
-        return try {
-            val a = JSONArray(f.readText())
-            (0 until a.length()).map {
-                val o = a.getJSONObject(it)
-                Item(
-                    o.getLong("id"), o.getString("kind"), o.getString("title"),
-                    o.optString("body"), o.optString("scope", "Month"),
-                    o.optLong("due"), o.optInt("priority", 1),
-                    o.optInt("target", 10), o.optInt("current"),
-                    o.optBoolean("done"), o.optBoolean("pinned"), o.optString("days")
-                )
-            }
-        } catch (e: Exception) { emptyList() }
-    }
-    fun save(c: Context, items: List<Item>) {
+    fun parse(text: String): List<Item> = try {
+        val a = JSONArray(text)
+        (0 until a.length()).map {
+            val o = a.getJSONObject(it)
+            Item(
+                o.getLong("id"), o.getString("kind"), o.getString("title"),
+                o.optString("body"), o.optString("scope", "Month"),
+                o.optLong("due"), o.optInt("priority", 1),
+                o.optInt("target", 10), o.optInt("current"),
+                o.optBoolean("done"), o.optBoolean("pinned"), o.optString("days"), o.optLong("doneAt")
+            )
+        }
+    } catch (e: Exception) { emptyList() }
+
+    fun toJson(items: List<Item>): String {
         val a = JSONArray()
         items.forEach {
             a.put(
                 JSONObject().put("id", it.id).put("kind", it.kind).put("title", it.title)
                     .put("body", it.body).put("scope", it.scope).put("due", it.due)
                     .put("priority", it.priority).put("target", it.target).put("current", it.current)
-                    .put("done", it.done).put("pinned", it.pinned).put("days", it.days)
+                    .put("done", it.done).put("pinned", it.pinned).put("days", it.days).put("doneAt", it.doneAt)
             )
         }
-        file(c).writeText(a.toString())
+        return a.toString()
     }
+
+    fun load(c: Context): List<Item> {
+        val f = file(c)
+        return if (f.exists()) parse(f.readText()) else emptyList()
+    }
+
+    fun save(c: Context, items: List<Item>) { file(c).writeText(toJson(items)) }
 }
 
 // ---------- DATE HELPERS ----------
@@ -220,6 +232,8 @@ fun App() {
     var tab by remember { mutableStateOf(0) }
     var edit by remember { mutableStateOf<Item?>(null) }
     var focus by remember { mutableStateOf(false) }
+    var more by remember { mutableStateOf(false) }
+    var review by remember { mutableStateOf(false) }
     val tabs = listOf("Today", "Tasks", "Goals", "Habits", "Notes")
     val kinds = listOf("task", "task", "goal", "habit", "note")
 
@@ -232,13 +246,41 @@ fun App() {
         c.isAppearanceLightNavigationBars = !dark
     }
 
-    fun persist() = Store.save(ctx, items)
+    fun persist() { Store.save(ctx, items); TasksWidget.refresh(ctx) }
     fun upsert(i: Item) {
         val ix = items.indexOfFirst { it.id == i.id }
         if (ix >= 0) items[ix] = i else items.add(0, i)
         persist()
+        Reminders.schedule(ctx, i)
     }
-    fun remove(i: Item) { items.removeAll { it.id == i.id }; persist() }
+    fun remove(i: Item) { items.removeAll { it.id == i.id }; persist(); Reminders.cancel(ctx, i) }
+
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        Reminders.scheduleAll(ctx, items)
+    }
+    val exportL = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri: Uri? ->
+        if (uri != null) {
+            ctx.contentResolver.openOutputStream(uri)?.use { os -> os.write(Store.toJson(items).toByteArray()) }
+            Toast.makeText(ctx, "Backup saved", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val importL = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) {
+            val txt = ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { r -> r.readText() }
+            val list = if (txt != null) Store.parse(txt) else emptyList()
+            if (list.isNotEmpty()) {
+                items.forEach { Reminders.cancel(ctx, it) }
+                items.clear(); items.addAll(list)
+                persist()
+                Reminders.scheduleAll(ctx, list)
+                Toast.makeText(ctx, "Restored ${list.size} items", Toast.LENGTH_SHORT).show()
+            } else Toast.makeText(ctx, "That file has no valid data", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     val scheme = if (dark)
         darkColorScheme(primary = Red, background = pal.bg, surface = pal.card, onSurface = pal.text, onBackground = pal.text, surfaceVariant = pal.card, onSurfaceVariant = pal.mute)
@@ -259,10 +301,7 @@ fun App() {
                         }
                         Pill("Focus", false) { focus = true }
                         Spacer(Modifier.width(6.dp))
-                        Pill(if (dark) "Light" else "Dark", false) {
-                            dark = !dark
-                            prefs.edit().putBoolean("dark", dark).apply()
-                        }
+                        Pill("More", false) { more = true }
                     }
                     Box(Modifier.weight(1f)) {
                         when (tab) {
@@ -307,6 +346,15 @@ fun App() {
                 )
             }
             if (focus) FocusDialog { focus = false }
+            if (more) MoreDialog(
+                dark,
+                onTheme = { dark = !dark; prefs.edit().putBoolean("dark", dark).apply() },
+                onBackup = { more = false; exportL.launch("planner-backup.json") },
+                onRestore = { more = false; importL.launch(arrayOf("application/json", "text/plain", "*/*")) },
+                onReview = { more = false; review = true },
+                onClose = { more = false }
+            )
+            if (review) ReviewDialog(items) { review = false }
         }
     }
 }
@@ -329,7 +377,7 @@ fun TodayScreen(items: List<Item>, onUpsert: (Item) -> Unit, onEdit: (Item) -> U
                 Row(verticalAlignment = Alignment.Bottom) {
                     Column(Modifier.weight(1f)) {
                         Tx("Done today", 11, LocalPal.current.mute, upper = true)
-                        Tx("$doneCount/${all.size}", 44, bold = true)
+                        DotText("$doneCount/${all.size}", 7)
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         Tx("Habits", 11, LocalPal.current.mute, upper = true)
@@ -394,7 +442,7 @@ fun TaskRow(item: Item, onUpsert: (Item) -> Unit, onEdit: (Item) -> Unit) {
                 Modifier.size(26.dp).clip(CircleShape)
                     .background(if (item.done) Red else Color.Transparent)
                     .border(1.5.dp, if (item.done) Red else pal.mute, CircleShape)
-                    .clickable { onUpsert(item.copy(done = !item.done)) },
+                    .clickable { onUpsert(item.copy(done = !item.done, doneAt = if (item.done) 0L else System.currentTimeMillis())) },
                 contentAlignment = Alignment.Center
             ) { if (item.done) Tx("v", 13, Color.White, bold = true) }
             Spacer(Modifier.width(12.dp))
@@ -641,7 +689,7 @@ fun FocusDialog(onClose: () -> Unit) {
         title = { Tx("Focus timer", 14, Red, bold = true, upper = true) },
         text = {
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                Tx(if (left <= 0) "DONE" else "%02d:%02d".format(left / 60, left % 60), 54, bold = true)
+                if (left <= 0) Tx("DONE", 40, bold = true) else DotText("%02d:%02d".format(left / 60, left % 60), 7)
                 Spacer(Modifier.height(14.dp))
                 Dots(1f - left / total.toFloat(), 25)
                 Spacer(Modifier.height(16.dp))
@@ -659,6 +707,117 @@ fun FocusDialog(onClose: () -> Unit) {
                         running = !running
                     }
                     Pill("Reset", false) { running = false; left = total }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Tx("Close", 13, pal.mute, upper = true) } }
+    )
+}
+
+// ---------- DOT-MATRIX TEXT (Nothing-style) ----------
+val GLYPHS = mapOf(
+    '0' to listOf("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    '1' to listOf("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    '2' to listOf("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    '3' to listOf("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    '4' to listOf("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    '5' to listOf("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    '6' to listOf("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    '7' to listOf("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    '8' to listOf("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    '9' to listOf("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+    '/' to listOf("00001", "00001", "00010", "00100", "01000", "10000", "10000"),
+    ':' to listOf("00000", "00100", "00100", "00000", "00100", "00100", "00000"),
+    ' ' to listOf("00000", "00000", "00000", "00000", "00000", "00000", "00000")
+)
+
+@Composable
+fun DotText(text: String, dot: Int = 6, color: Color = LocalPal.current.text) {
+    val off = LocalPal.current.line
+    Canvas(Modifier.size((text.length * 6 * dot).dp, (7 * dot).dp)) {
+        val d = dot.dp.toPx()
+        text.forEachIndexed { ci, ch ->
+            val g = GLYPHS[ch] ?: GLYPHS[' ']!!
+            for (r in 0 until 7) for (c in 0 until 5) {
+                drawCircle(
+                    if (g[r][c] == '1') color else off,
+                    radius = d * 0.38f,
+                    center = Offset(ci * 6 * d + c * d + d / 2, r * d + d / 2)
+                )
+            }
+        }
+    }
+}
+
+// ---------- MORE + WEEKLY REVIEW ----------
+@Composable
+fun MoreDialog(
+    dark: Boolean, onTheme: () -> Unit, onBackup: () -> Unit, onRestore: () -> Unit,
+    onReview: () -> Unit, onClose: () -> Unit
+) {
+    val pal = LocalPal.current
+    AlertDialog(
+        onDismissRequest = onClose,
+        containerColor = pal.card,
+        title = { Tx("More", 14, Red, bold = true, upper = true) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Tx("Tools", 10, pal.mute, upper = true)
+                Row { Pill("Weekly review", false, onReview) }
+                Row { Pill(if (dark) "Switch to light" else "Switch to dark", false, onTheme) }
+                Tx("Your data", 10, pal.mute, upper = true)
+                Row { Pill("Backup to file", false, onBackup) }
+                Row { Pill("Restore from file", false, onRestore) }
+                Tx("Reminders arrive at 9:00 AM on a deadline day. Restore replaces everything currently in the app.", 11, pal.mute)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Tx("Close", 13, pal.mute, upper = true) } }
+    )
+}
+
+@Composable
+fun ReviewDialog(items: List<Item>, onClose: () -> Unit) {
+    val pal = LocalPal.current
+    val day = 86_400_000L
+    val s0 = dayStart()
+    val counts = (6 downTo 0).map { b ->
+        val st = s0 - b * day
+        items.count { it.kind == "task" && it.doneAt >= st && it.doneAt < st + day }
+    }
+    val total = counts.sum()
+    val overdue = items.count { it.kind == "task" && !it.done && it.due in 1 until s0 }
+    val habits = items.filter { it.kind == "habit" }
+    val hits = habits.fold(0) { a, h -> a + (0..6).count { d -> dayKey(-d) in habitSet(h.days) } }
+    val rate = if (habits.isEmpty()) 0f else hits.toFloat() / (habits.size * 7)
+    val goals = items.filter { it.kind == "goal" }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        containerColor = pal.card,
+        title = { Tx("Weekly review", 14, Red, bold = true, upper = true) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Tx("Tasks completed (7 days)", 10, pal.mute, upper = true)
+                DotText("$total", 7)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    counts.forEachIndexed { i, c ->
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Tx("$c", 13, bold = true)
+                            Tx(dayLetter(6 - i), 9, pal.mute)
+                        }
+                    }
+                }
+                Tx("Overdue right now: $overdue", 12, if (overdue > 0) Red else pal.text)
+                Tx("Habit consistency", 10, pal.mute, upper = true)
+                Dots(rate, 20)
+                Tx("${(rate * 100).roundToInt()}% of check-ins hit this week", 12)
+                if (goals.isNotEmpty()) {
+                    Tx("Goals", 10, pal.mute, upper = true)
+                    goals.take(6).forEach { g ->
+                        val p = if (g.target > 0) g.current.toFloat() / g.target else 0f
+                        Tx("${g.title}  ${(p * 100).roundToInt()}%", 12)
+                        Dots(p, 20)
+                    }
                 }
             }
         },
